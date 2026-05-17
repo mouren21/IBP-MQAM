@@ -1,23 +1,8 @@
-"""
-Complete DPPO for QAM-only Semantic Communication (per paper spec)
-- Encoder: ResNet-18 → 512-d features
-- Decoder: 3-layer FC → 10 classes
-- Training Phase 1: Pretrain encoder/decoder with AWGN layer
-- Phase 2: STR+ISR importance (omega) computation and caching
-- Phase 3: DPPO with dynamic discrete actions (1..min(remaining_bits, 8)) over 512-step episode
-- Quantizer: Non-subtractive uniform dither scalar quantizer
-- Channel: 64QAM modulation + AWGN
-
-DPPO 特征顺序约定（训练与评估必须一致）：
-- 特征步进顺序：固定为 encoder 输出维度索引 0..D-1，不按 omega 重排；比特在信道中的打包顺序与步进一致
-- 状态中 omega：build_state 仍传入完整 [omega[0], ..., omega[D-1]]，策略从 ω 得知各维重要性而不改变维序
-"""
-
 import os
 import math
 import random
 import copy
-import gc  # 垃圾回收
+import gc  
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 
@@ -52,6 +37,7 @@ def _dppo_feature_visit_order(feat_dim: int) -> List[int]:
 
 
 def _decoder_first_linear_weight(decoder: nn.Module) -> Optional[torch.Tensor]:
+    """SemanticDecoder：net[0] 为 Linear，返回 W1 形状 [out_dim, in_dim]（与 320.py / 406.py 一致）。"""
     if decoder is None:
         return None
     try:
@@ -64,6 +50,7 @@ def _decoder_first_linear_weight(decoder: nn.Module) -> Optional[torch.Tensor]:
 
 
 def _nsv_diag_task_var(Zc: torch.Tensor, W1: torch.Tensor) -> np.ndarray:
+    """320.py: task_diag = ||W 的第 j 列||²，var_diag = Zc 列方差；对角近似 h·λ。"""
     n_m1 = max(Zc.shape[0] - 1, 1)
     var_diag = (Zc.pow(2).sum(dim=0) / n_m1).cpu().numpy()
     task_diag = (W1.float().pow(2).sum(dim=0)).cpu().numpy()
@@ -71,7 +58,11 @@ def _nsv_diag_task_var(Zc: torch.Tensor, W1: torch.Tensor) -> np.ndarray:
 
 
 def _nsv_pca_h_lam_Q(Zc: torch.Tensor, W1: torch.Tensor) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-
+    """
+    406.py：对 Sigma_x = Zc^T Zc/(n-1) 特征分解，lambda_k 为特征值（降序），
+    h_k = ||W1 q_k||_2^2（解码器第一层在特征向量 q_k 上的灵敏度）。
+    返回 h, lam, Q（Q 的列与 h、lam 同序，均为大特征值在前）。
+    """
     n = Zc.shape[0]
     d = Zc.shape[1]
     zf = Zc.double()
@@ -96,7 +87,11 @@ def get_nsv_power_closed_form(
         n0: float,
         p_tot: float,
 ) -> np.ndarray:
-
+    """
+    406.py get_nsv 闭式注水（代数 NSV 最优功率分配）：
+        p_i = max( sqrt(h_i * lambda_i * n0 / (nu * g_i^2)) - n0/g_i^2 , 0 )
+    其中 nu* 由二分法使 sum_i p_i = P_tot。
+    """
     h = np.maximum(np.asarray(h, dtype=np.float64), 1e-30)
     lam = np.maximum(np.asarray(lam, dtype=np.float64), 1e-30)
     g_sq = np.maximum(np.asarray(g_sq, dtype=np.float64), 1e-30)
@@ -134,7 +129,7 @@ def get_nsv_power_closed_form(
 
 
 def nsv_mode_power_to_coordinate_weights(Q: np.ndarray, p_mode: np.ndarray) -> np.ndarray:
-
+    """将各主模上的注水功率 p_k 映回原始坐标 j：w_j = sum_k Q[j,k]^2 * p_k（与特征索引对齐）。"""
     p_mode = np.asarray(p_mode, dtype=np.float64).ravel()
     q = np.asarray(Q, dtype=np.float64)
     k = min(q.shape[1], p_mode.shape[0])
@@ -148,6 +143,19 @@ def compute_optimal_alpha_analytical(omega_batch: torch.Tensor, bit_allocation_b
                                      use_nsv_weights: bool = True,
                                      nsv_bit_coupling: float = 0.2,
                                      nsv_weight_scheme: str = "406") -> float:
+    """
+    根据已确定的比特分配方案，连续、精确地求解当前 Batch 最优的 alpha。
+
+    权重模式
+    --------
+    - **nsv_weight_scheme == "406"**（默认）：与 406/320 一致
+        * 用当前 batch 特征 Z 中心化得 Sigma_x，特征分解得 lambda_k、正交基 Q；
+        * h_k = ||W1 q_k||^2，W1 为 SemanticDecoder 第一层 Linear 权重；
+        * 按 406 闭式 NSV 注水在模式上得功率 p_k（总预算 P_tot 取本 batch 已分配总比特，信道增益取 g^2=1）；
+        * 将 p 映回原始维度 w_j = sum_k Q[j,k]^2 p_k，再乘 (1 + gamma * total_bits) 作为该分配项的 alpha 优化权重。
+    - **nsv_weight_scheme == "diag"**：对角近似 w_j ∝ (diag(W^T W))_j * 列方差 * (1+gamma*bits)，不再做 PCA+注水。
+    - **use_nsv_weights 为 False**：仅用 omega 加权（最简旧版）。
+    """
     # 如果没有导入误码率计算模块，返回默认值
     if not _SER_AVAILABLE:
         return 0.5
@@ -253,6 +261,7 @@ def compute_optimal_alpha_analytical(omega_batch: torch.Tensor, bit_allocation_b
 
 
 class DatasetWithIndex(Dataset):
+    """包装 Dataset，__getitem__ 返回 (sample, label, index)，用于按索引取预计算的每图 omega。"""
 
     def __init__(self, dataset: Dataset):
         self.dataset = dataset
@@ -269,7 +278,10 @@ class DatasetWithIndex(Dataset):
 
 # IBP动作映射：固定 alpha=0.4、按欧氏距离排序，与 QAM 一致在 4dB 训练、全 SNR 评估
 def build_ibp_action_space(max_bits):
-
+    """
+    构建IBP动作空间：(总比特, 重要比特)组合，0 <= total <= max_bits，含0比特(0,0)。
+    排序：按 (total, imp) 相对 (0,0) 的欧氏距离升序排列（与 QAM 一致）。
+    """
     actions = [(0, 0)]  # 0比特为合法动作
     for total in range(1, max_bits + 1):
         for imp in range(total + 1):
@@ -284,7 +296,7 @@ def build_ibp_action_space(max_bits):
 def build_ibp_action_space_for_snr(snr_db, max_bits, mse_data=None, optimal_alpha_data=None):
     """
     动作空间：按 (total, imp) 相对 (0,0) 的欧氏距离升序排列（与 QAM 一致，统一训练/评估）。
-    固定 alpha=0.5，不再使用 MSE 表或最优 alpha。mse_data/optimal_alpha_data 保留兼容。
+    固定 alpha=0.4，不再使用 MSE 表或最优 alpha。mse_data/optimal_alpha_data 保留兼容。
     """
     return build_ibp_action_space(max_bits)
 
@@ -295,7 +307,25 @@ if device.type == "cuda":
     torch.backends.cudnn.benchmark = True  # 固定输入尺寸时加速卷积
 
 # ==================== Codebook-based quantization & dequantization (for QAM & IBP) ====================
+"""
+量化与码本（QAM vs IBP）：
+- QAM：编码端 DitherQuantizer.quantize_feature 始终为均匀抖动量化，不使用码本。解码端 dequantize_from_int
+  若存在 ibp_qam_codebooks.pth 则查表，否则线性反量化。故仅解码用码本时与编码端电平可能不一致。
+- IBP：编码端 IBPQuantizer.quantize_with_ibp 在有码本时为无抖动、找最近码本电平；无码本时为无抖动均匀量化。
+  解码端 dequantize_from_int 同上（有码本查表，否则线性）。编码与解码均可用码本，保持一致。
+- 码本文件结构：{bit_width: 1D Tensor[2^bit_width]}。建议用 build_improved_codebooks.py 生成。
 
+训练与评估：量化和调制逻辑一致，无差别。唯一差别为 IBP 评估可按 SNR 加载不同模型与动作空间，QAM 用同一模型。
+
+语义重要性 omega 与失真尺度（本质，按论文来）：
+- 论文 Fig.11 明确："the importance values of all the semantics in the image are normalized to have a **sum of 1**"。因此 Eq.(10) 中的 d = Σ ωi|ai−a'i|² 在 Σωi=1 下是**加权平均** MSE，尺度为 0～几，不是几十上百。
+- 论文 Fig.6 的 "MSE is less than 1" 指**信道估计 MSE**（channel estimation），与语义失真 d 无关。
+- **正确设定（论文一致）**：omega 做 min-max 后**再归一化为 sum=1**，L0=10（Table I）。这样 d 为加权平均、训练目标与论文一致，才能训出应有结果。
+
+诊断「高 SNR 下 IBP 任务准确率仅 ~62% 而非 ~96%」：
+- 若训练未用码本而评估时加载了码本，解码重建与训练分布不一致。可设 FORCE_LINEAR_DEQUANT_IBP=1
+  使编码/解码均退化为均匀+线性；若准确率恢复则问题在码本与训练不匹配。
+"""
 try:
     _loaded_codebooks = torch.load("ibp_qam_codebooks.pth", map_location="cpu")
     # 统一成 {int(bit_width): 1D tensor}，在第一次使用时搬到 device 上
@@ -308,7 +338,15 @@ except Exception:
 
 
 def dequantize_from_int(int_val: int, total_bits: int, device_: Optional[torch.device] = None) -> torch.Tensor:
-
+    """
+    给定整数 int_val 和比特数 total_bits，返回对应的重建连续值：
+    - 如果存在 codebook 且未强制线性，则优先查表（codebook[total_bits][int_val]）
+    - 否则退回到原来的线性反量化公式
+    返回的是位于指定 device_（或当前全局 device）上的 0-D Tensor。
+    诊断：若高 SNR 下任务准确率远低于预期（如 62% 而非 ~96%），可设环境变量
+    FORCE_LINEAR_DEQUANT_IBP=1 强制使用线性反量化；若此时准确率恢复，则问题在码本（训练时
+    未用码本 / 码本与编码端不一致 / 码本索引或数值范围异常）。
+    """
     if device_ is None:
         device_ = device
 
@@ -1445,7 +1483,7 @@ def _compute_omega_per_image_impl(
 @dataclass
 class PPOConfig:
     state_dim: int = 1 + 512 + 3  # a_i + omega(512) + [rem/total, rem_imp/init_imp, rem_nsk/init_nsk]
-    action_max_per_step: int = 10
+    action_max_per_step: int = 8
     learning_rate: float = 1e-3  # 论文 δ=1×10⁻³
     gamma: float = 0.99  # 论文 discount factor η=0.99
     gae_lambda: float = 0.95  # GAE λ（论文未单独给出）
@@ -1453,7 +1491,7 @@ class PPOConfig:
     # 论文 Eq.(20)：c1 为 value loss 权重、c2 为 entropy bonus 权重
     value_coef: float = 0.05  # 论文 c₁=0.5
     entropy_coef: float = 0.001  # 论文 c₂=0.01
-    update_epochs: int =5  # 每次 update() 内梯度轮数（原10，减半以加速训练）
+    update_epochs: int =1  # 每次 update() 内梯度轮数（原10，减半以加速训练）
     batch_size: int = 128
     minibatch: int = 64  # 单次 update() 内每个 minibatch 的样本数；小 batch 时避免 minibatch 过大
     max_grad_norm: float = 0.5
@@ -1471,7 +1509,7 @@ class PPOConfig:
     use_per_image_omega_train: bool = True
     use_per_image_omega_eval: bool = True
     # 是否对 value loss 做尺度归一化：adv 已归一化，ret 尺度可达 500–3500，不归一化易导致 Critic 梯度过大、难以收敛
-    normalize_value_target: bool = True
+    normalize_value_target: bool = False
     # 是否使用差分奖励：r_k = (Lk - β·dk) - (L_{k-1} - β·d_{k-1})，避免绝对效用导致的负分累积
     use_difference_reward: bool = False
     # IBP alpha EMA 更新：tau 大则 alpha 更快逼近 opt_alpha（0.2≈5次更新达63%，0.05需20次）
@@ -1480,7 +1518,7 @@ class PPOConfig:
     alpha_update_interval: int = 5
     # IBP alpha 解析优化：NSV（406 闭式注水 + 320/406 的 W1 与 Sigma 特征分解）。True 时传入 feats_batch+decoder；False 时仅 omega
     alpha_use_nsv_weights: bool = True
-    alpha_nsv_bit_coupling: float = 0.2  # γ：每特征分配比特 total_bits 对 alpha 目标的增益系数
+    alpha_nsv_bit_coupling: float = 0.3  # γ：每特征分配比特 total_bits 对 alpha 目标的增益系数
     # "406"：PCA + h_k=||W1 q_k||^2 + get_nsv 注水功率映回坐标；"diag"：仅用 diag(W^T W)*列方差
     alpha_nsv_weight_scheme: str = "406"
     # 课程学习：True 时在 -6 到 4 dB（步长2）上均分训练步数
@@ -1489,9 +1527,9 @@ class PPOConfig:
     low_memory_mode: bool = True
     # === 比特使用行为约束（关键：避免大量 0-bit 导致预算未用完）===
     # 每步选择 0 比特时的惩罚（仅在 remaining>0 时生效）；越大越逼迫“有预算就分配”
-    zero_bit_penalty: float = 0.02
+    zero_bit_penalty: float = 0.2
     # episode 结束时剩余比特的惩罚（按 remaining/total_budget 线性）；越大越逼迫“用满 1000bit”
-    leftover_bit_penalty: float = 0.05
+    leftover_bit_penalty: float = 0.4
 
 
 def _ppo_checkpoint_path(mode: str, action_max_per_step: int) -> str:
@@ -2960,7 +2998,7 @@ def train_dppo_mode(encoder, decoder, omega, train_loader, mode='qam', epochs=20
     """
     images_per_round = 2000  # 大批量加速，内存紧张时减小
     _use_curriculum = use_curriculum if use_curriculum is not None else False
-    _alpha_update_interval = alpha_update_interval if alpha_update_interval is not None else 1
+    _alpha_update_interval = alpha_update_interval if alpha_update_interval is not None else 5
 
     # 启用 cuDNN benchmark 以加速卷积等算子（输入尺寸固定时有效）
     if torch.cuda.is_available():
@@ -2968,7 +3006,7 @@ def train_dppo_mode(encoder, decoder, omega, train_loader, mode='qam', epochs=20
 
     # 课程学习：-6 到 4 dB，步长 2，均分训练步数
     CURRICULUM_SNR_LIST = [-6.0, -4.0, -2.0, 0.0, 2.0, 4.0]
-    FIXED_SNR = 5.0
+    FIXED_SNR = -6.0
 
     if mode == 'ibp':
         snr_list = CURRICULUM_SNR_LIST if _use_curriculum else [FIXED_SNR]
@@ -4030,7 +4068,28 @@ def evaluate_som_mode(encoder, decoder, omega_per_image_test, test_loader, L=2, 
     # 确保所有模型处于评估模式
     encoder.eval()
     decoder.eval()
+    """
+    评估SOM模式的性能 - 直接将特征映射到符号，但遵循资源约束。
+    test_loader 须返回 (imgs, labels, indices)。语义重要性由 use_per_image_omega_eval 控制：
+    - True: 每张图使用 omega_per_image_test[indices[b]]（每图重要性）
+    - False: 所有图使用全局重要性 omega_per_image_test.mean(dim=0)
 
+    Args:
+        encoder: 语义编码器（与QAM/IBP相同）
+        decoder: 语义解码器（与QAM/IBP相同）
+        omega_per_image_test: 每图语义重要性 [N_test, 512]
+        test_loader: 须为 DatasetWithIndex 的 loader，返回 (imgs, labels, indices)
+        L: SOM层数（默认3）
+        M: SOM每层调制阶数（默认4）
+        max_symbols: 最大符号数（默认166，对应1000比特预算，1000/6≈166）
+        use_per_image_omega_eval: 若 True 按每图重要性选特征，若 False 按全局重要性选特征（与 QAM/IBP 评估一致）
+
+    注意：
+    - 使用相同的encoder/decoder（✓）
+    - 遵循资源约束：最多传输max_symbols个符号（每对特征需要L层符号）
+    - 按 use_per_image_omega_eval 选择全局/每图重要性，再按重要性选特征两两成对送入 SOM
+    - 每个特征对需要L个符号（L层），所以最多可传输 max_symbols//L 对特征
+    """
     som_mod = SOMModulator(L=L, M=M, gamma=1.0)
     use_per_img = use_per_image_omega_eval
     omega_eval_global = None if use_per_img else omega_per_image_test.mean(dim=0).to(device)
@@ -4114,7 +4173,28 @@ def evaluate_sdmcm_mode(encoder, decoder, omega_per_image_test, test_loader, n_b
     # 确保所有模型处于评估模式
     encoder.eval()
     decoder.eval()
+    """
+    评估 sDMCM 模式的性能 - 直接将特征映射到符号，遵循资源约束。
+    test_loader 须返回 (imgs, labels, indices)。语义重要性由 use_per_image_omega_eval 控制：
+    - True: 每张图使用 omega_per_image_test[indices[b]]（每图重要性）
+    - False: 所有图使用全局重要性 omega_per_image_test.mean(dim=0)
 
+    Args:
+        encoder: 语义编码器（与QAM/IBP相同）
+        decoder: 语义解码器（与QAM/IBP相同）
+        omega_per_image_test: 每图语义重要性 [N_test, 512]
+        test_loader: 须为 DatasetWithIndex 的 loader，返回 (imgs, labels, indices)
+        n_bits: 量化比特数（默认4）
+        m_bits: 调制阶数（默认6，即64-QAM）
+        max_symbols: 最大符号数（默认166，对应1000比特预算，1000/6≈166）
+        use_per_image_omega_eval: 若 True 按每图重要性选特征，若 False 按全局重要性选特征（与 QAM/IBP 评估一致）
+
+    注意：
+    - 使用相同的encoder/decoder（✓）
+    - 遵循资源约束：最多传输max_symbols个符号
+    - 按 use_per_image_omega_eval 选择全局/每图重要性，再选特征两两成对送入 sDMCM
+    - 每个符号对应2个特征（I和Q分量）
+    """
     sdmcm_mod = SDMCMMapper(n_bits=n_bits, m_bits=m_bits, gamma=1.0)
     use_per_img = use_per_image_omega_eval
     omega_eval_global = None if use_per_img else omega_per_image_test.mean(dim=0).to(device)
@@ -4195,7 +4275,11 @@ def train_jscc_mode(train_loader: DataLoader, val_loader: Optional[DataLoader] =
                     epochs: int = 50, snr_train_db: float = 4.0,
                     snr_schedule: Optional[List[float]] = None,
                     save_paths: Tuple[str, str] = ("jscc_encoder.pth", "jscc_decoder.pth")):
-
+    """
+    训练 JSCC：仅一对编解码器，对接处166符号。
+    - JSCCEncoder(图像) → 166符号 → AWGN → JSCCDecoder → 10类
+    - 不依赖语义 encoder/decoder，完全独立
+    """
     enc_path, dec_path = save_paths
     enc_abs = os.path.abspath(enc_path)
     dec_abs = os.path.abspath(dec_path)
@@ -4491,7 +4575,7 @@ def main():
     # ========== 步骤4: 训练QAM和IBP两种DPPO模型 ==========
     print("\n【步骤4】训练两种DPPO模型（固定SNR=5dB）...")
     # 每特征允许分配的最大比特数（动作上限）：训练与评估必须一致
-    ACTION_MAX_PER_STEP = 10
+    ACTION_MAX_PER_STEP = 8
     # False：DPPO 每步对增强后的图像在线 encoder，语义状态随 RandomResizedCrop 等变化；True：用上方预计算特征（更快、易过拟合）
     USE_CACHED_FEATURES_FOR_DPPO = False
     if not USE_CACHED_FEATURES_FOR_DPPO:
@@ -4501,17 +4585,17 @@ def main():
 
     # 恢复训练配置
     RESUME_FROM_10DB = 1  # 0=有 ppo_actor/critic 则只加载并跳过训练；1=加载后继续训练
-    ADDITIONAL_EPOCHS = 500 # resume=1 时作为继续训练的 epoch 数（>0）；若为 0 则继续训练仍用上面的 epochs=
+    ADDITIONAL_EPOCHS = 30 # resume=1 时作为继续训练的 epoch 数（>0）；若为 0 则继续训练仍用上面的 epochs=
     # 课程学习：从 PPOConfig 读取，True 时 IBP/QAM 均在 -6~4dB 均分训练
     _train_cfg = PPOConfig(use_curriculum=False)
     USE_CURRICULUM = _train_cfg.use_curriculum
-
+    '''
     # 训练QAM模式
     print("\n--- 训练QAM模式 ---")
     ppo_qam, rewards_qam = train_dppo_mode(
         encoder, decoder, omega, test_loader_indexed,
         mode='qam',
-        epochs=100,
+        epochs=13,
         iterations_per_epoch=10,
         use_curriculum=USE_CURRICULUM,
         resume_from_10db=RESUME_FROM_10DB,
@@ -4520,13 +4604,13 @@ def main():
         features_per_image=(features_per_image_test if USE_CACHED_FEATURES_FOR_DPPO else None),
         low_memory_mode=LOW_MEMORY,
     )
-
+    '''
     # 训练IBP模式
     print("\n--- 训练IBP模式 ---")
     ppo_ibp, rewards_ibp = train_dppo_mode(
         encoder, decoder, omega, test_loader_indexed,
         mode='ibp',
-        epochs=100,
+        epochs=72,
         iterations_per_epoch=10,
         max_bits=ACTION_MAX_PER_STEP,
         use_curriculum=USE_CURRICULUM,
@@ -4586,7 +4670,7 @@ def main():
                                                 use_per_image_omega_eval=use_per_image_omega_eval,
                                                 features_per_image_test=features_per_image_test)
 
-
+ 
     print(f"\n评估sDMCM模式:")
     # sDMCM使用相同的资源约束：1000比特预算 ≈ 166个符号（1000/6）
     # 每个符号对应2个特征，所以最多传输166*2=332个特征
@@ -4610,8 +4694,7 @@ def main():
         jscc_enc, jscc_dec, test_loader_indexed,
         num=1000, snr_values=snr_values1,
     )
-
-
+    
 
 if __name__ == "__main__":
     main()
